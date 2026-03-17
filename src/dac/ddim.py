@@ -1,5 +1,4 @@
 import math
-from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import flax.linen as nn
@@ -7,6 +6,7 @@ from flax.training import train_state
 import jax
 import jax.numpy as jnp
 import optax
+from flax import struct
 
 from .mhdm import DiffusionBlock
 
@@ -26,7 +26,7 @@ def make_beta_schedule(
     return jnp.linspace(beta_start, beta_end, num_train_steps, dtype=jnp.float32)
 
 
-@dataclass
+@struct.dataclass
 class DDIMSchedule:
     betas: Array                  # (T,)
     alphas: Array                 # (T,)
