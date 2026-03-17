@@ -1,78 +1,24 @@
-from __future__ import annotations
-
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 import jax
 import jax.numpy as jnp
-from jax.nn import softmax, silu
+import flax.linen as nn
+from flax.training import train_state
+import optax
+
 
 Array = jnp.ndarray
-PyTree = Dict[str, Any]
 
 
 # ============================================================
-# Basic parameter helpers
-# ============================================================
-
-def glorot_init(key: Array, in_dim: int, out_dim: int) -> Array:
-    limit = jnp.sqrt(6.0 / float(in_dim + out_dim))
-    return jax.random.uniform(key, (in_dim, out_dim), minval=-limit, maxval=limit)
-
-
-def zeros_init(shape) -> Array:
-    return jnp.zeros(shape, dtype=jnp.float32)
-
-
-def init_dense(key: Array, in_dim: int, out_dim: int, bias: bool = True, zero: bool = False) -> PyTree:
-    W = zeros_init((in_dim, out_dim)) if zero else glorot_init(key, in_dim, out_dim)
-    b = zeros_init((out_dim,)) if bias else None
-    return {"W": W, "b": b}
-
-
-def apply_dense(params: PyTree, x: Array) -> Array:
-    y = x @ params["W"]
-    if params["b"] is not None:
-        y = y + params["b"]
-    return y
-
-
-def init_layer_norm(dim: int, eps: float = 1e-6) -> PyTree:
-    return {
-        "scale": jnp.ones((dim,), dtype=jnp.float32),
-        "bias": jnp.zeros((dim,), dtype=jnp.float32),
-        "eps": jnp.array(eps, dtype=jnp.float32),
-    }
-
-
-def apply_layer_norm(params: PyTree, x: Array) -> Array:
-    mean = jnp.mean(x, axis=-1, keepdims=True)
-    var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
-    xhat = (x - mean) / jnp.sqrt(var + params["eps"])
-    return xhat * params["scale"] + params["bias"]
-
-
-def init_mlp(key: Array, widths, zero_last: bool = False) -> PyTree:
-    keys = jax.random.split(key, len(widths) - 1)
-    layers = []
-    for i, (k, din, dout) in enumerate(zip(keys, widths[:-1], widths[1:])):
-        layers.append(init_dense(k, din, dout, bias=True, zero=(zero_last and i == len(widths) - 2)))
-    return {"layers": layers}
-
-
-def apply_mlp(params: PyTree, x: Array, activation=silu) -> Array:
-    h = x
-    for layer in params["layers"][:-1]:
-        h = activation(apply_dense(layer, h))
-    return apply_dense(params["layers"][-1], h)
-
-
-# ============================================================
-# Shape helpers
+# Helpers
 # ============================================================
 
 def _to_heads(x: Array, num_heads: int) -> Array:
-    """(B, N, D) -> (B, H, N, d)"""
+    """
+    (B, N, D) -> (B, H, N, d)
+    """
     B, N, D = x.shape
     if D % num_heads != 0:
         raise ValueError(f"D={D} must be divisible by num_heads={num_heads}")
@@ -81,334 +27,461 @@ def _to_heads(x: Array, num_heads: int) -> Array:
 
 
 def _from_heads(x: Array) -> Array:
-    """(B, H, N, d) -> (B, N, D)"""
+    """
+    (B, H, N, d) -> (B, N, D)
+    """
     B, H, N, dh = x.shape
     return x.transpose(0, 2, 1, 3).reshape(B, N, H * dh)
 
 
-# ============================================================
-# Timestep embedding + AdaLN-Zero style modulation
-# ============================================================
-
 def timestep_embedding(t: Array, dim: int, max_period: int = 10000) -> Array:
     """
     Standard sinusoidal embedding.
-    t: shape (B,) or scalar. Expected in [0, 1] or any real scale.
+    t: scalar or shape (B,)
     returns: (B, dim)
     """
     t = jnp.asarray(t, dtype=jnp.float32)
     if t.ndim == 0:
         t = t[None]
+
     half = dim // 2
-    freqs = jnp.exp(-math.log(max_period) * jnp.arange(half, dtype=jnp.float32) / max(half, 1))
+    freqs = jnp.exp(
+        -math.log(max_period) * jnp.arange(half, dtype=jnp.float32) / max(half, 1)
+    )
     args = t[:, None] * freqs[None, :]
     emb = jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1)
+
     if dim % 2 == 1:
         emb = jnp.pad(emb, ((0, 0), (0, 1)))
     return emb
 
 
-def init_time_conditioner(key: Array, dim: int, hidden_dim: Optional[int] = None) -> PyTree:
+def modulate(x: Array, shift: Array, scale: Array) -> Array:
     """
-    Produces per-branch AdaLN parameters and per-feature metric scalings.
-    Final projections are zero-initialized so the block starts near identity.
+    x:     (B, N, D)
+    shift: (B, D)
+    scale: (B, D)
     """
-    if hidden_dim is None:
-        hidden_dim = 4 * dim
-    k1, k2, k3 = jax.random.split(key, 3)
-    return {
-        "embed_mlp": init_mlp(k1, [hidden_dim, hidden_dim, hidden_dim], zero_last=False),
-        # shift, scale, gate, log_gamma for token diffusion
-        "attn_out": init_dense(k2, hidden_dim, 4 * dim, bias=True, zero=True),
-        # shift, scale, gate, log_gamma for channel diffusion
-        "ch_out": init_dense(k3, hidden_dim, 4 * dim, bias=True, zero=True),
-    }
-
-
-def apply_time_conditioner(params: PyTree, t: Array, dim: int) -> PyTree:
-    emb = timestep_embedding(t, params["embed_mlp"]["layers"][0]["W"].shape[0])
-    h = apply_mlp(params["embed_mlp"], emb, activation=silu)
-    attn = apply_dense(params["attn_out"], h)
-    ch = apply_dense(params["ch_out"], h)
-
-    def split4(y):
-        a, b, c, d = jnp.split(y, 4, axis=-1)
-        return {"shift": a, "scale": b, "gate": c, "log_gamma": d}
-
-    return {"attn": split4(attn), "ch": split4(ch)}
-
-
-def adaln_modulate(x_norm: Array, mod: PyTree) -> Array:
-    shift = mod["shift"][:, None, :]
-    scale = mod["scale"][:, None, :]
-    return x_norm * (1.0 + scale) + shift
+    return x * (1.0 + scale[:, None, :]) + shift[:, None, :]
 
 
 # ============================================================
-# MHDM core: DMAP-style tied Q=K with optional Doob tilt
+# AdaLN-Zero style time conditioner
 # ============================================================
 
-def init_mhdm_core(key: Array, dim: int, num_heads: int, bias: bool = False, use_doob: bool = True) -> PyTree:
-    if dim % num_heads != 0:
-        raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
-    keys = jax.random.split(key, 4 if use_doob else 3)
-    params = {
-        "dim": dim,
-        "num_heads": num_heads,
-        "qk_proj": init_dense(keys[0], dim, dim, bias=bias),
-        "v_proj": init_dense(keys[1], dim, dim, bias=bias),
-        "out_proj": init_dense(keys[2], dim, dim, bias=bias),
-        "use_doob": use_doob,
-    }
-    if use_doob:
-        # Zero-init => h=1 at initialization.
-        params["doob_proj"] = init_dense(keys[3], dim, 1, bias=True, zero=True)
-    return params
-
-
-def _pairwise_neg_sqdist(q: Array, k: Array) -> Array:
+class AdaLNTimeConditioner(nn.Module):
     """
-    q: (B, H, M, d)
-    k: (B, H, N, d)
-    returns logits: (B, H, M, N) = -||q-k||^2
+    Produces per-branch:
+      shift, scale, gate, log_gamma
+    where:
+      - shift/scale are AdaLN params
+      - gate is DiT-style residual gating
+      - log_gamma is the time-dependent metric scaling
     """
-    dot = jnp.einsum("bhmd,bhnd->bhmn", q, k)
-    q2 = jnp.sum(q * q, axis=-1, keepdims=True)          # (B, H, M, 1)
-    k2 = jnp.sum(k * k, axis=-1)[:, :, None, :]          # (B, H, 1, N)
-    return 2.0 * dot - q2 - k2
+    dim: int
+    hidden_dim: Optional[int] = None
+
+    @nn.compact
+    def __call__(self, t: Array) -> Dict[str, Dict[str, Array]]:
+        hidden = self.hidden_dim or (4 * self.dim)
+
+        emb = timestep_embedding(t, hidden)
+        h = nn.Dense(hidden)(emb)
+        h = nn.silu(h)
+        h = nn.Dense(hidden)(h)
+        h = nn.silu(h)
+
+        # zero init => near-identity block at initialization
+        zero_kernel = nn.initializers.zeros_init()
+        zero_bias = nn.initializers.zeros_init()
+
+        attn_out = nn.Dense(
+            4 * self.dim,
+            kernel_init=zero_kernel,
+            bias_init=zero_bias,
+            name="attn_out",
+        )(h)
+
+        ch_out = nn.Dense(
+            4 * self.dim,
+            kernel_init=zero_kernel,
+            bias_init=zero_bias,
+            name="ch_out",
+        )(h)
+
+        def split4(y):
+            shift, scale, gate, log_gamma = jnp.split(y, 4, axis=-1)
+            return {
+                "shift": shift,
+                "scale": scale,
+                "gate": gate,
+                "log_gamma": log_gamma,
+            }
+
+        return {
+            "attn": split4(attn_out),
+            "ch": split4(ch_out),
+        }
 
 
-def mhdm_cross_apply(
-    params: PyTree,
-    query_x: Array,
-    support_x: Array,
-    query_mod: Optional[PyTree] = None,
-    support_mod: Optional[PyTree] = None,
-    add_doob: bool = True,
-) -> Tuple[Array, PyTree]:
+# ============================================================
+# MHDM
+# ============================================================
+
+class MHDM(nn.Module):
     """
-    Cross-operator version for novel-point queries.
+    Token diffusion-style attention with tied Q=K projection.
+    Input:  x (B, N, D)
+    Output: y (B, N, D)
 
-    query_x   : (B, M, D)
-    support_x : (B, N, D)
+    If context is given:
+      x       = query cloud  (B, M, D)
+      context = support cloud (B, N, D)
+      output  = (B, M, D)
 
-    The Doob tilt is added on the destination/support index j:
-        softmax_j(logits_ij + phi_j)
-    not on the source/query index i.
+    Symmetric distance logits:
+      logits_ij = -||qk_i - qk_j||^2
+
+    Optional Doob tilt:
+      softmax_j(logits_ij + phi_j)
+
+    Important:
+      adding phi_i (row/source potential) would cancel under softmax.
+      the nontrivial Doob tilt is on the destination/support index j.
     """
-    num_heads = params["num_heads"]
-    dim = params["dim"]
+    dim: int
+    num_heads: int
+    bias: bool = False
+    use_doob: bool = True
 
-    q_in = query_x if query_mod is None else adaln_modulate(query_x, query_mod)
-    s_in = support_x if support_mod is None else adaln_modulate(support_x, support_mod)
+    @nn.compact
+    def __call__(
+        self,
+        x: Array,
+        *,
+        context: Optional[Array] = None,
+        log_gamma_q: Optional[Array] = None,
+        log_gamma_k: Optional[Array] = None,
+        phi: Optional[Array] = None,
+    ) -> Tuple[Array, Dict[str, Array]]:
+        if self.dim % self.num_heads != 0:
+            raise ValueError(f"dim={self.dim} must be divisible by num_heads={self.num_heads}")
 
-    qk_q = apply_dense(params["qk_proj"], q_in)  # (B, M, D)
-    qk_s = apply_dense(params["qk_proj"], s_in)  # tied Q=K projection
-    v_s = apply_dense(params["v_proj"], s_in)    # (B, N, D)
+        support = x if context is None else context
 
-    # Optional positive feature-wise metric scaling gamma(t).
-    if query_mod is not None and "log_gamma" in query_mod:
-        qk_q = qk_q * jnp.exp(query_mod["log_gamma"][:, None, :])
-    if support_mod is not None and "log_gamma" in support_mod:
-        qk_s = qk_s * jnp.exp(support_mod["log_gamma"][:, None, :])
+        qk_proj = nn.Dense(self.dim, use_bias=self.bias, name="qk_proj")
+        v_proj = nn.Dense(self.dim, use_bias=self.bias, name="v_proj")
+        out_proj = nn.Dense(self.dim, use_bias=self.bias, name="out_proj")
 
-    qh = _to_heads(qk_q, num_heads)  # (B, H, M, d)
-    kh = _to_heads(qk_s, num_heads)  # (B, H, N, d)
-    vh = _to_heads(v_s, num_heads)   # (B, H, N, d)
+        qk_q = qk_proj(x)        # (B, M, D)
+        qk_k = qk_proj(support)  # tied Q=K
+        v = v_proj(support)      # values come from support set
 
-    logits = _pairwise_neg_sqdist(qh, kh)
-    logits = logits / jnp.sqrt(float(dim // num_heads))
+        if log_gamma_q is not None:
+            qk_q = qk_q * jnp.exp(log_gamma_q)[:, None, :]
+        if log_gamma_k is not None:
+            qk_k = qk_k * jnp.exp(log_gamma_k)[:, None, :]
 
-    phi = None
-    if params.get("use_doob", False) and add_doob:
-        phi = apply_dense(params["doob_proj"], s_in)[..., 0]   # (B, N)
-        logits = logits + phi[:, None, None, :]  # destination-side potential
+        qh = _to_heads(qk_q, self.num_heads)  # (B, H, M, d)
+        kh = _to_heads(qk_k, self.num_heads)  # (B, H, N, d)
+        vh = _to_heads(v, self.num_heads)     # (B, H, N, d)
 
-    attn = softmax(logits, axis=-1)
-    w = jnp.einsum("bhmn,bhnd->bhmd", attn, vh)
-    out = apply_dense(params["out_proj"], _from_heads(w))
+        dot = jnp.einsum("bhmd,bhnd->bhmn", qh, kh)
+        q2 = jnp.sum(qh * qh, axis=-1, keepdims=True)       # (B,H,M,1)
+        k2 = jnp.sum(kh * kh, axis=-1)[:, :, None, :]       # (B,H,1,N)
 
-    return out, {"attn": attn, "logits": logits, "phi": phi}
+        logits = 2.0 * dot - q2 - k2  # = -||q-k||^2
+
+        # Optional Doob potential on destination/support index j
+        if self.use_doob:
+            if phi is None:
+                phi = nn.Dense(
+                    1,
+                    use_bias=True,
+                    kernel_init=nn.initializers.zeros_init(),
+                    bias_init=nn.initializers.zeros_init(),
+                    name="doob_proj",
+                )(support)[..., 0]  # (B, N)
+            logits = logits + phi[:, None, None, :]
+
+        attn = nn.softmax(logits, axis=-1)
+        w = jnp.einsum("bhmn,bhnd->bhmd", attn, vh)
+
+        out = _from_heads(w)
+        out = out_proj(out)
+
+        aux = {
+            "attn": attn,
+            "logits": logits,
+        }
+        if phi is not None:
+            aux["phi"] = phi
+
+        return out, aux
 
 
-def mhdm_self_apply(
-    params: PyTree,
-    x: Array,
-    mod: Optional[PyTree] = None,
-    add_doob: bool = True,
-) -> Tuple[Array, PyTree]:
-    return mhdm_cross_apply(
-        params=params,
-        query_x=x,
-        support_x=x,
-        query_mod=mod,
-        support_mod=mod,
-        add_doob=add_doob,
+# ============================================================
+# MHDM_ (channel version, close to your PyTorch version)
+# ============================================================
+
+class MHDM_(nn.Module):
+    """
+    Channel version: transpose token/channel axes and run the same mechanism.
+    Input:  x (B, N, D)
+    Output: y (B, N, D)
+
+    Important:
+      Here the Dense layers act on the last dim N, so they are shape-dependent
+      on token length at init time, exactly like your lazy PyTorch logic.
+    """
+    num_heads: int = 1
+    bias: bool = False
+
+    @nn.compact
+    def __call__(self, x: Array) -> Tuple[Array, Dict[str, Array]]:
+        B, N, D = x.shape
+        if N % self.num_heads != 0:
+            raise ValueError(f"N={N} must be divisible by num_heads={self.num_heads}")
+
+        y = x.transpose(0, 2, 1)  # (B, D, N)
+
+        qk = nn.Dense(N, use_bias=self.bias, name="qk_proj")(y)  # (B, D, N)
+        v = nn.Dense(N, use_bias=self.bias, name="v_proj")(y)    # (B, D, N)
+
+        qh = _to_heads(qk, self.num_heads)  # treats D as sequence length, N as embedding
+        vh = _to_heads(v, self.num_heads)
+
+        dot = jnp.einsum("bhmd,bhnd->bhmn", qh, qh)
+        q2 = jnp.sum(qh * qh, axis=-1, keepdims=True)
+        logits = 2.0 * dot - q2 - jnp.swapaxes(q2, -1, -2)
+
+        attn = nn.softmax(logits, axis=-1)
+        w = jnp.einsum("bhmn,bhnd->bhmd", attn, vh)
+
+        y = _from_heads(w)  # (B, D, N)
+        y = nn.Dense(N, use_bias=self.bias, name="out_proj")(y)
+
+        return y.transpose(0, 2, 1), {"attn": attn, "logits": logits}
+
+
+# ============================================================
+# ChannelDiffusion
+# ============================================================
+
+class ChannelDiffusion(nn.Module):
+    """
+    Learns a feature-space transform W (D->D) and computes diffusion logits
+    as negative squared Euclidean distances BETWEEN CHANNEL VECTORS across tokens.
+
+    Input:  x (B, N, D)
+    Output: y (B, N, D)
+
+    Params depend on D, not on N.
+    """
+    dim: int
+    num_heads: int = 8
+    bias: bool = False
+    temperature: bool = True
+
+    @nn.compact
+    def __call__(
+        self,
+        x: Array,
+        *,
+        log_gamma: Optional[Array] = None,
+    ) -> Tuple[Array, Dict[str, Array]]:
+        if self.dim % self.num_heads != 0:
+            raise ValueError(f"dim={self.dim} must be divisible by num_heads={self.num_heads}")
+
+        B, N, D = x.shape
+        dh = self.dim // self.num_heads
+
+        qk = nn.Dense(self.dim, use_bias=self.bias, name="qk_proj")(x)
+        v = nn.Dense(self.dim, use_bias=self.bias, name="v_proj")(x)
+
+        if log_gamma is not None:
+            qk = qk * jnp.exp(log_gamma)[:, None, :]
+
+        # Channels-as-sequence
+        qk = qk.transpose(0, 2, 1)  # (B, D, N)
+        v = v.transpose(0, 2, 1)    # (B, D, N)
+
+        # (B, H, dh, N)
+        qk = qk.reshape(B, self.num_heads, dh, N)
+        v = v.reshape(B, self.num_heads, dh, N)
+
+        dot = jnp.einsum("bhcn,bhdn->bhcd", qk, qk)
+        q2 = jnp.sum(qk * qk, axis=-1)  # (B,H,dh)
+        logits = 2.0 * dot - q2[:, :, :, None] - q2[:, :, None, :]
+
+        # same stabilization idea as your PyTorch version
+        logits = logits / math.sqrt(max(N, 1))
+
+        if self.temperature:
+            tau = self.param(
+                "tau",
+                lambda key, shape: jnp.ones(shape, dtype=jnp.float32),
+                (self.num_heads, 1, 1),
+            )
+            logits = logits * tau[None, ...]
+
+        attn = nn.softmax(logits, axis=-1)
+        w = jnp.einsum("bhcd,bhdn->bhcn", attn, v)
+
+        out = w.reshape(B, D, N).transpose(0, 2, 1)
+        out = nn.Dense(self.dim, use_bias=self.bias, name="out_proj")(out)
+
+        return out, {"attn": attn, "logits": logits}
+
+
+# ============================================================
+# Diffusion_Block with time conditioning
+# ============================================================
+
+class DiffusionBlock(nn.Module):
+    """
+    Flax/JAX analogue of your PyTorch block, but time-conditioning ready.
+
+    Time conditioning is injected by:
+      - AdaLN shift/scale
+      - DiT-style residual gates
+      - log_gamma(t) metric scaling
+    """
+    dim: int
+    num_heads: int
+    channel_heads: int = 8
+    dropout: float = 0.0
+    bias: bool = False
+    use_time: bool = True
+    use_doob: bool = True
+
+    @nn.compact
+    def __call__(
+        self,
+        x: Array,
+        t: Optional[Array] = None,
+        *,
+        deterministic: bool = True,
+    ) -> Tuple[Array, Dict[str, Any]]:
+        drop = nn.Dropout(rate=self.dropout)
+
+        norm1 = nn.LayerNorm(use_bias=True, use_scale=True, name="norm1")
+        norm2 = nn.LayerNorm(use_bias=True, use_scale=True, name="norm2")
+
+        x1 = norm1(x)
+        x2_input = None
+
+        # default "no conditioning"
+        B = x.shape[0]
+        zeros = jnp.zeros((B, self.dim), dtype=x.dtype)
+        mods = {
+            "attn": {"shift": zeros, "scale": zeros, "gate": zeros, "log_gamma": zeros},
+            "ch": {"shift": zeros, "scale": zeros, "gate": zeros, "log_gamma": zeros},
+        }
+
+        if self.use_time:
+            if t is None:
+                raise ValueError("t must be provided when use_time=True")
+            mods = AdaLNTimeConditioner(self.dim, name="time_cond")(t)
+            x1 = modulate(x1, mods["attn"]["shift"], mods["attn"]["scale"])
+
+        attn_out, attn_aux = MHDM(
+            dim=self.dim,
+            num_heads=self.num_heads,
+            bias=self.bias,
+            use_doob=self.use_doob,
+            name="attn",
+        )(
+            x1,
+            log_gamma_q=mods["attn"]["log_gamma"] if self.use_time else None,
+            log_gamma_k=mods["attn"]["log_gamma"] if self.use_time else None,
+        )
+
+        gamma1 = self.param(
+            "gamma1",
+            lambda key, shape: 1e-4 * jnp.ones(shape, dtype=jnp.float32),
+            (self.dim,),
+        )
+
+        x = x + drop(attn_out, deterministic=deterministic) * mods["attn"]["gate"][:, None, :] * gamma1
+
+        x2 = norm2(x)
+        if self.use_time:
+            x2 = modulate(x2, mods["ch"]["shift"], mods["ch"]["scale"])
+
+        ch_out, ch_aux = ChannelDiffusion(
+            dim=self.dim,
+            num_heads=self.channel_heads,
+            bias=self.bias,
+            temperature=True,
+            name="ch_attn",
+        )(
+            x2,
+            log_gamma=mods["ch"]["log_gamma"] if self.use_time else None,
+        )
+
+        gamma2 = self.param(
+            "gamma2",
+            lambda key, shape: 1e-4 * jnp.ones(shape, dtype=jnp.float32),
+            (self.dim,),
+        )
+
+        x = x + drop(ch_out, deterministic=deterministic) * mods["ch"]["gate"][:, None, :] * gamma2
+
+        aux = {
+            "mods": mods,
+            "attn": attn_aux,
+            "channel": ch_aux,
+        }
+        return x, aux
+
+
+# ============================================================
+# Minimal Optax training scaffold
+# ============================================================
+
+class TrainState(train_state.TrainState):
+    pass
+
+
+def create_train_state(
+    rng: Array,
+    model: nn.Module,
+    x_shape: Tuple[int, int, int],
+    learning_rate: float = 1e-3,
+) -> TrainState:
+    B, N, D = x_shape
+    x = jnp.zeros((B, N, D), dtype=jnp.float32)
+    t = jnp.zeros((B,), dtype=jnp.float32)
+
+    variables = model.init(rng, x, t, deterministic=True)
+    tx = optax.adamw(learning_rate)
+    return TrainState.create(
+        apply_fn=model.apply,
+        params=variables["params"],
+        tx=tx,
     )
 
 
-# ============================================================
-# Channel diffusion core
-# ============================================================
-
-def init_channel_diffusion_core(
-    key: Array,
-    dim: int,
-    num_heads: int = 8,
-    bias: bool = False,
-    learn_temperature: bool = True,
-) -> PyTree:
-    if dim % num_heads != 0:
-        raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
-    k1, k2, k3 = jax.random.split(key, 3)
-    params = {
-        "dim": dim,
-        "num_heads": num_heads,
-        "dh": dim // num_heads,
-        "qk_proj": init_dense(k1, dim, dim, bias=bias),
-        "v_proj": init_dense(k2, dim, dim, bias=bias),
-        "out_proj": init_dense(k3, dim, dim, bias=bias),
-    }
-    if learn_temperature:
-        params["tau"] = jnp.ones((num_heads, 1, 1), dtype=jnp.float32)
-    return params
-
-
-def channel_diffusion_apply(params: PyTree, x: Array, mod: Optional[PyTree] = None) -> Tuple[Array, PyTree]:
-    """
-    Diffusion across channel-vectors, mirroring the PyTorch block.
-    x: (B, N, D)
-    """
-    B, N, D = x.shape
-    H = params["num_heads"]
-    dh = params["dh"]
-
-    x_in = x if mod is None else adaln_modulate(x, mod)
-
-    qk = apply_dense(params["qk_proj"], x_in)  # (B, N, D)
-    v = apply_dense(params["v_proj"], x_in)    # (B, N, D)
-
-    if mod is not None and "log_gamma" in mod:
-        qk = qk * jnp.exp(mod["log_gamma"][:, None, :])
-
-    # Channels-as-sequence: (B, D, N)
-    qk = qk.transpose(0, 2, 1)
-    v = v.transpose(0, 2, 1)
-
-    # Split across channels: (B, H, dh, N)
-    qk = qk.reshape(B, H, dh, N)
-    v = v.reshape(B, H, dh, N)
-
-    dot = jnp.einsum("bhcn,bhdn->bhcd", qk, qk)
-    q2 = jnp.sum(qk * qk, axis=-1)
-    logits = 2.0 * dot - q2[..., :, None] - q2[..., None, :]
-    logits = logits / jnp.sqrt(float(max(N, 1)))
-
-    if "tau" in params:
-        logits = logits * params["tau"][None, ...]
-
-    attn = softmax(logits, axis=-1)
-    w = jnp.einsum("bhcd,bhdn->bhcn", attn, v)
-
-    out = w.reshape(B, D, N).transpose(0, 2, 1)
-    out = apply_dense(params["out_proj"], out)
-    return out, {"attn": attn, "logits": logits}
-
-
-# ============================================================
-# Full diffusion block with time conditioning
-# ============================================================
-
-def init_diffusion_block(
-    key: Array,
-    dim: int,
-    num_heads: int,
-    channel_heads: int = 8,
-    bias: bool = False,
-    use_doob: bool = True,
-) -> PyTree:
-    k1, k2, k3, k4, k5 = jax.random.split(key, 5)
-    return {
-        "norm1": init_layer_norm(dim),
-        "attn": init_mhdm_core(k1, dim=dim, num_heads=num_heads, bias=bias, use_doob=use_doob),
-        "norm2": init_layer_norm(dim),
-        "channel": init_channel_diffusion_core(k2, dim=dim, num_heads=channel_heads, bias=bias),
-        "time": init_time_conditioner(k3, dim=dim),
-        # LayerScale / AdaLN-Zero style residual gates start tiny.
-        "gamma1": 1e-4 * jnp.ones((dim,), dtype=jnp.float32),
-        "gamma2": 1e-4 * jnp.ones((dim,), dtype=jnp.float32),
-    }
-
-
-def diffusion_block_apply(
-    params: PyTree,
+@jax.jit
+def train_step(
+    state: TrainState,
     x: Array,
     t: Array,
-    *,
-    add_doob: bool = True,
-) -> Tuple[Array, PyTree]:
-    """
-    x: (B, N, D)
-    t: scalar or (B,) timestep / noise level
-    """
-    D = x.shape[-1]
-    mods = apply_time_conditioner(params["time"], t, dim=D)
+    target: Array,
+    rng: Array,
+):
+    def loss_fn(params):
+        (y, aux) = state.apply_fn(
+            {"params": params},
+            x,
+            t,
+            deterministic=False,
+            rngs={"dropout": rng},
+        )
+        loss = jnp.mean((y - target) ** 2)
+        return loss, {"loss": loss, "aux": aux}
 
-    # Token diffusion branch
-    x1 = apply_layer_norm(params["norm1"], x)
-    attn_out, attn_aux = mhdm_self_apply(
-        params["attn"],
-        x=x1,
-        mod=mods["attn"],
-        add_doob=add_doob,
-    )
-    gate1 = mods["attn"]["gate"][:, None, :]
-    x = x + attn_out * gate1 * params["gamma1"]
-
-    # Channel diffusion branch
-    x2 = apply_layer_norm(params["norm2"], x)
-    ch_out, ch_aux = channel_diffusion_apply(params["channel"], x2, mod=mods["ch"])
-    gate2 = mods["ch"]["gate"][:, None, :]
-    x = x + ch_out * gate2 * params["gamma2"]
-
-    aux = {
-        "mods": mods,
-        "attn": attn_aux,
-        "channel": ch_aux,
-    }
-    return x, aux
-
-
-# ============================================================
-# Example usage
-# ============================================================
-
-def _demo() -> None:
-    key = jax.random.PRNGKey(0)
-    B, N, D = 2, 16, 32
-    H = 4
-
-    x = jax.random.normal(key, (B, N, D))
-    t = jnp.array([0.25, 0.75], dtype=jnp.float32)
-
-    block = init_diffusion_block(key, dim=D, num_heads=H, channel_heads=H, use_doob=True)
-    y, aux = diffusion_block_apply(block, x, t)
-    print("input shape ", x.shape)
-    print("output shape", y.shape)
-    print("token attn  ", aux["attn"]["attn"].shape)
-    print("channel attn", aux["channel"]["attn"].shape)
-
-    # Novel-point query against a support cloud using the same learned kernel.
-    query = jax.random.normal(jax.random.PRNGKey(1), (B, 1, D))
-    x_norm = apply_layer_norm(block["norm1"], x)
-    q_norm = apply_layer_norm(block["norm1"], query)
-    mods = apply_time_conditioner(block["time"], t, dim=D)
-    qy, _ = mhdm_cross_apply(
-        block["attn"],
-        query_x=q_norm,
-        support_x=x_norm,
-        query_mod=mods["attn"],
-        support_mod=mods["attn"],
-        add_doob=True,
-    )
-    print("query output", qy.shape)
+    (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    state = state.apply_gradients(grads=grads)
+    return state, metrics
