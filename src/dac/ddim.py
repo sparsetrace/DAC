@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from mhdm import DiffusionBlock
+from .mhdm import DiffusionBlock
 
 
 Array = jnp.ndarray
